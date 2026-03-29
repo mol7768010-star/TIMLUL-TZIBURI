@@ -3,102 +3,118 @@ import logging
 import requests
 from flask import Flask, request
 
+# הגדרת לוגים למעקב
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
+# תיקייה זמנית בשרת Render לאחסון נתונים במהלך השיחה
 TEMP_DIR = "/tmp/"
 
 def recognize_speech(file_path):
+    """פונקציה לביצוע תמלול באמצעות Google Speech Recognition"""
     import speech_recognition as sr
     recognizer = sr.Recognizer()
     try:
         with sr.AudioFile(file_path) as source:
             audio = recognizer.record(source)
+        # תמלול לעברית
         return recognizer.recognize_google(audio, language="he-IL")
-    except Exception:
+    except Exception as e:
+        logging.error(f"Speech recognition error: {e}")
         return ""
 
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
-    # שליפת פרמטרים
+    # שליפת פרמטרים מה-URL
     token = request.args.get('token')
-    k_path = request.args.get('K')
-    m_param = request.args.get('M') # חובה - תגובה ראשונית
-    n_param = request.args.get('N') # חובה - נתיב שמירה סופי
+    k_path = request.args.get('K')     # נתיב הקובץ שהוקלט
+    m_param = request.args.get('M', '5') # תיקיית הקלטה (ברירת מחדל 5)
+    n_param = request.args.get('N')     # תיקיית יעד לשמירת ה-TTS
     api_id = request.args.get('ApiCallId')
     ok_val = request.args.get('OK')
 
-    if not m_param or not api_id:
-        return "Missing M or ApiCallId", 400
+    # בדיקת פרמטרים חיוניים
+    if not api_id:
+        return "Missing ApiCallId", 400
 
-    # הגדרת נתיבי קבצים זמניים מבוססי ApiCallId
-    text_file = os.path.join(TEMP_DIR, f"trans_{api_id}.txt")
-    ignore_file = os.path.join(TEMP_DIR, f"ignore_{api_id}.txt")
+    # הגדרת נתיבי קבצים זמניים מבוססי ApiCallId כדי למנוע ערבוב בין שיחות
+    text_storage = os.path.join(TEMP_DIR, f"trans_{api_id}.txt")
+    ignore_flag = os.path.join(TEMP_DIR, f"ignore_{api_id}.txt")
 
-    # --- שלב בדיקת התעלמות מ-OK=2 קודם ---
-    if os.path.exists(ignore_file):
-        os.remove(ignore_file) # מוחקים את הדגל לפעם הבאה
-        ok_val = None # מבטלים את השפעת ה-OK הנוכחי
+    # --- לוגיקה לטיפול ב-OK=2 (התעלמות מהפרמטר בקריאה הבאה) ---
+    if os.path.exists(ignore_flag):
+        logging.info(f"Ignoring old OK value for ApiCallId: {api_id}")
+        os.remove(ignore_flag)
+        ok_val = None # מבטל את ה-OK הנוכחי כי הוא "שארית" מהסיבוב הקודם
 
-    # --- לוגיקה של שלב 2 (אישור/דחייה) ---
+    # --- שלב 2: עיבוד בחירת המשתמש (אישור או הקלטה מחדש) ---
     if ok_val == "1":
-        # המשתמש אישר - שמירה סופית ל-N
-        if os.path.exists(text_file):
-            with open(text_file, "r", encoding="utf-8") as f:
-                saved_text = f.read()
+        # המשתמש אישר את התמלול - שמירה סופית לשרת Call2All
+        if os.path.exists(text_storage) and token and n_param:
+            with open(text_storage, "r", encoding="utf-8") as f:
+                final_text = f.read()
             
-            # בניית נתיב השמירה מתוך שם הקובץ המקורי ב-K
-            file_name = k_path.split('/')[-1] if k_path else "file.wav"
-            final_path = f"ivr2:{n_param}/{file_name.replace('.wav', '.tts')}"
+            # חילוץ שם הקובץ המקורי ושמירה בסיומת .tts בתיקייה N
+            orig_filename = k_path.split('/')[-1] if k_path else "recorded.wav"
+            upload_path = f"ivr2:{n_param}/{orig_filename.replace('.wav', '.tts')}"
 
+            # שליחת הטקסט לשרת Call2All (דחיפת ה-TTS)
             upload_url = "https://www.call2all.co.il/ym/api/UploadTextFile"
-            requests.get(upload_url, params={"token": token, "path": final_path, "content": saved_text})
+            requests.get(upload_url, params={
+                "token": token, 
+                "path": upload_path, 
+                "content": final_text
+            })
             
-            # ניקוי
-            if os.path.exists(text_file): os.remove(text_file)
-            return "id_list_message=f-הקובץ_נשמר_בהצלחה&"
-        return "id_list_message=f-שגיאה_לא_נמצא_טקסט&"
+            # ניקוי קבצים זמניים
+            if os.path.exists(text_storage): os.remove(text_storage)
+            return "id_list_message=m-1452&" # תגובה סופית
+        return "id_list_message=f-Error_No_Text&"
 
     elif ok_val == "2":
-        # המשתמש ביקש להקליט מחדש
-        # יוצרים קובץ "התעלמות" כדי שבקריאה הבאה (שתכיל OK=2 ב-URL) לא ניכנס לפה שוב
-        with open(ignore_file, "w") as f: f.write("1")
-        # חוזר לתגובה ראשונית (הקלטה)
-        return f"read=m-1012=NAME,,record,{m_param},,no"
+        # המשתמש בחר להקליט מחדש
+        with open(ignore_flag, "w") as f: f.write("ignore")
+        return f"read=m-1012=K,,record,{m_param},,no"
 
-    # --- שלב 1: הקלטה ראשונית או תמלול ---
+    # --- שלב 1: הקלטה או תמלול ראשוני ---
     if not k_path:
-        # פעם ראשונה - בקשת הקלטה לנתיב M
-        return f"read=m-1012=NAME,,record,{m_param},,no"
+        # פעם ראשונה בשלוחה - שליחה להקלטה
+        return f"read=m-1012=K,,record,{m_param},,no"
 
-    # אם יש K, סימן שהקלטנו ועכשיו מתמללים
+    # אם יש K, סימן שהקובץ הוקלט - מתחילים תמלול
+    if not token: return "Missing Token", 400
+    
     download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
     
     try:
-        response = requests.get(download_url)
-        if response.status_code != 200:
-            return "id_list_message=f-שגיאה_בהורדת_הקובץ&"
+        # הורדת קובץ השמע זמנית
+        audio_response = requests.get(download_url)
+        if audio_response.status_code != 200:
+            return "id_list_message=f-Error_Downloading&"
 
-        audio_temp = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
-        with open(audio_temp, "wb") as f:
-            f.write(response.content)
+        temp_audio_path = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
+        with open(temp_audio_path, "wb") as f:
+            f.write(audio_response.content)
 
-        text = recognize_speech(audio_temp)
-        if os.path.exists(audio_temp): os.remove(audio_temp)
+        # ביצוע התמלול
+        transcribed_text = recognize_speech(temp_audio_path)
+        if os.path.exists(temp_audio_path): os.remove(temp_audio_path)
 
-        if not text:
-            return "id_list_message=f-לא_הצלחתי_לתמלל&"
+        if not transcribed_text:
+            return "id_list_message=f-לא_הצלחתי_לתמלל_נסה_שנית&"
 
-        # שמירת הטקסט לזיכרון זמני
-        with open(text_file, "w", encoding="utf-8") as f:
-            f.write(text)
+        # שמירת הטקסט בשרת עד לקבלת אישור OK=1
+        with open(text_storage, "w", encoding="utf-8") as f:
+            f.write(transcribed_text)
 
-        # הקראת התמלול למשתמש ובקשת אישור (OK)
-        return f"read=m-1078.t-{text}=OK,,1,1,,NO,,,,12,,,,,no"
+        # החזרת פלט TTS להקראה ואישור המשתמש
+        return f"read=m-1078.t-{transcribed_text}=OK,,1,1,,NO,,,,12,,,,,no"
 
     except Exception as e:
+        logging.error(f"General error: {e}")
         return f"Error: {str(e)}"
 
 if __name__ == "__main__":
+    # הגדרת הפורט עבור Render
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
