@@ -1,0 +1,5 @@
+flask
+speechrecognition
+requests
+pydub
+gunicorn
