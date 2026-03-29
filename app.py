@@ -20,13 +20,18 @@ def recognize_speech(file_path):
 
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
-    # קבלת פרמטרים מה-URL
+    # קבלת פרמטרים
     token = request.args.get('token')
-    k_path = request.args.get('K') # הנתיב שאחרי ivr2:
-    n_param = request.args.get('N') # נתיב חלופי במידה וקיים
+    k_path = request.args.get('K')
+    m_param = request.args.get('M', '') # תוכן הפרמטר M
+    n_param = request.args.get('N')
 
-    if not token or not k_path:
-        return "Missing parameters", 400
+    # בדיקה אם חסר פרמטר K
+    if not k_path:
+        return f"read=m-1012=NAME,,record,{m_param},,no"
+
+    if not token:
+        return "Missing token", 400
 
     # בניית נתיב ההורדה
     download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
@@ -46,15 +51,12 @@ def transcribe():
         os.remove(temp_path)
 
         # לוגיקה לבניית נתיב השמירה (Upload)
-        # נניח ש-k_path הוא: 1/M1000.wav
         path_parts = k_path.split('/')
-        file_name = path_parts[-1] # M1000.wav
+        file_name = path_parts[-1]
         
         if n_param:
-            # אם יש N, נחליף את התיקייה
             upload_path = f"ivr2:{n_param}/{file_name.replace('.wav', '.tts')}"
         else:
-            # אם אין N, נשמור באותה תיקייה עם סיומת tts
             upload_path = f"ivr2:{k_path.replace('.wav', '.tts')}"
 
         # העלאת הטקסט חזרה
@@ -66,7 +68,7 @@ def transcribe():
         }
         requests.get(upload_url, params=upload_params)
 
-        # החזרת תשובה לדפדפן/למערכת
+        # החזרת תשובה
         return text if text else "No transcription"
 
     except Exception as e:
