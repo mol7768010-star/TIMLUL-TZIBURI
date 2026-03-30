@@ -15,13 +15,33 @@ def recognize_speech(file_path):
     except Exception as e:
         return f"ERROR_SR: {str(e)}"
 
+def get_next_file_name(token, folder_path):
+    """
+    פונקציה שבודקת מהו הקובץ הכי גבוה בשלוחה ומחזירה את המספר הבא בתור עם סיומת .tts
+    """
+    url = "https://www.call2all.co.il/ym/api/GetIVR2DirStats"
+    params = {"token": token, "path": f"ivr2:{folder_path}"}
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        if data.get("responseStatus") == "OK" and data.get("maxFile", {}).get("exists"):
+            max_name = data["maxFile"]["name"]  # למשל "386.wav"
+            name_without_ext = max_name.split('.')[0]
+            if name_without_ext.isdigit():
+                next_number = int(name_without_ext) + 1
+                return f"{next_number:03d}.tts" # שומר על פורמט 3 ספרות אם תרצה, או פשוט str
+        return "000.tts" # ברירת מחדל אם השלוחה ריקה
+    except Exception:
+        return "error_name.tts"
+
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
-    # שליפת פרמטרים מהכתובת
+    # שליפת פרמטרים
     token = request.args.get('token', '')
     k_path = request.args.get('K', '')
     m_param = request.args.get('M', '5')
     n_param = request.args.get('N', '')
+    path_param = request.args.get('path', '') # הפרמטר החדש
     api_id = request.args.get('ApiCallId', '')
     ok_val = request.args.get('OK', '')
     log_enabled = request.args.get('LOG') == "1"
@@ -34,7 +54,6 @@ def transcribe():
     text_storage = os.path.join(TEMP_DIR, f"trans_{api_id}.txt")
     ignore_flag = os.path.join(TEMP_DIR, f"ignore_{api_id}.txt")
 
-    # בדיקת דגל התעלמות (עבור OK=2 קודם)
     if os.path.exists(ignore_flag):
         os.remove(ignore_flag)
         ok_val = None
@@ -45,34 +64,36 @@ def transcribe():
             with open(text_storage, "r", encoding="utf-8") as f:
                 final_text = f.read()
             
-            # בניית נתיב השמירה: לוקח את שם הקובץ מ-K ומדביק ל-N
-            orig_filename = k_path.split('/')[-1] if k_path else "file.wav"
-            upload_path = f"ivr2:{n_param}/{orig_filename.replace('.wav', '.tts')}"
+            # קביעת יעד השמירה
+            if path_param:
+                # אם נשלח path, מחפשים את המספר הבא בשלוחה
+                target_folder = path_param
+                filename = get_next_file_name(token, target_folder)
+                upload_path = f"ivr2:{target_folder}/{filename}"
+            else:
+                # אם נשלח N (או כברירת מחדל), עובדים לפי הלוגיקה הישנה
+                orig_filename = k_path.split('/')[-1] if k_path else "file.wav"
+                upload_path = f"ivr2:{n_param}/{orig_filename.replace('.wav', '.tts')}"
             
-            # --- התיקון לבקשתך: שימוש ב-what וב-contents ---
             upload_url = "https://www.call2all.co.il/ym/api/UploadTextFile"
             params = {
                 "token": token,
-                "what": upload_path,      # במקום path
-                "contents": final_text    # במקום content
+                "what": upload_path,
+                "contents": final_text
             }
             
-            if log_enabled: logs.append(f"Sending to Call2All: {upload_url} | params: {params}")
+            if log_enabled: logs.append(f"Target path: {upload_path}")
             
             try:
                 response = requests.get(upload_url, params=params)
-                if log_enabled: logs.append(f"Call2All Response: {response.status_code} - {response.text}")
-                
                 if response.status_code == 200:
                     os.remove(text_storage)
-                    res = "id_list_message=m-1452."
+                    res = "id_list_message=m-1452." # הודעת סיום מוצלחת
                 else:
                     res = f"id_list_message=f-Server_Error_{response.status_code}."
             except Exception as e:
-                if log_enabled: logs.append(f"Request Error: {str(e)}")
                 res = "id_list_message=f-Connection_Error."
         else:
-            if log_enabled: logs.append("Error: Stored text file not found.")
             res = "id_list_message=f-No_Stored_Text."
 
         return "<br>".join(logs) if log_enabled else res
@@ -86,7 +107,6 @@ def transcribe():
     if not k_path:
         return f"read=m-1012=K,,record,{m_param},,no"
 
-    # ביצוע תמלול לקובץ שהתקבל ב-K
     download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
     
     try:
@@ -102,11 +122,10 @@ def transcribe():
             if "ERROR_SR" in text:
                 return "id_list_message=f-Error_Transcription."
             
-            # שמירה זמנית בשרת
             with open(text_storage, "w", encoding="utf-8") as f:
                 f.write(text)
             
-            # החזרת הפלט להקראה (טקסט לפני הודעת מערכת 1078)
+            # החזרת הפלט למשתמש לאישור (OK=1 לאישור, OK=2 להקלטה מחדש)
             return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
         else:
             return "id_list_message=f-Download_Failed."
