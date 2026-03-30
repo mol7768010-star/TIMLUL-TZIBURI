@@ -5,6 +5,12 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 TEMP_DIR = "/tmp/"
 
+CALL2ALL_STATS_URL = "https://www.call2all.co.il/ym/api/GetIVR2DirStats"
+CALL2ALL_DOWNLOAD_URL = "https://www.call2all.co.il/ym/api/DownloadFile"
+GOOGLE_CHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAQAWjjfDoU/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI"
+
+GOOGLE_APPS_SCRIPT = "https://script.google.com/macros/s/AKfycbzBOXpGWhA0NJbWarVO0kkl9Lx_VnXeAtTKJuV8zadx2ScYXyB10Epe422rceUWOUTaRA/exec"
+
 def recognize_speech(file_path):
     import speech_recognition as sr
     recognizer = sr.Recognizer()
@@ -17,67 +23,74 @@ def recognize_speech(file_path):
 
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
-    # --- קריאת פרמטרים ---
-    api_id = request.args.get("ApiCallId")
-    token = request.args.get("token")
-    token_g = request.args.get("token_g")
-    url_external = request.args.get("URL")
-    path_dir = request.args.get("path")
+    # שליפת פרמטרים
+    token = request.args.get('token', '')
+    token_g = request.args.get('token_g', '')
+    path_param = request.args.get('path', '')
+    api_id = request.args.get('ApiCallId', '')
 
-    if not api_id or not token or not token_g or not url_external or not path_dir:
+    if not all([token, token_g, path_param, api_id]):
         return "Missing required parameters", 400
 
-    # --- שלב 1: קבלת מידע על התיקייה והקובץ האחרון ---
-    stats_url = f"https://www.call2all.co.il/ym/api/GetIVR2DirStats?token={token}&path=ivr2:{path_dir}"
+    # --- שליחת GET מיידית ל-Google Apps Script ---
     try:
-        stats_resp = requests.get(stats_url)
+        apps_resp = requests.get(GOOGLE_APPS_SCRIPT, params={"T": 1, "M": "פייתון"})
+        apps_status = apps_resp.status_code
+    except Exception as e:
+        apps_status = f"error: {str(e)}"
+
+    # --- שלב 1: קבלת מידע על הקבצים ב-Call2All ---
+    try:
+        stats_resp = requests.get(CALL2ALL_STATS_URL, params={"token": token, "path": f"ivr2:{path_param}"})
         stats_resp.raise_for_status()
         stats_json = stats_resp.json()
-        max_file = stats_json.get("maxFile", {})
-        if not max_file or not max_file.get("exists"):
-            return "No audio file found", 404
-        audio_path = max_file["path"]  # לדוגמה: 111/374.wav
+        max_file = stats_json["maxFile"]["name"]
     except Exception as e:
-        return f"Error fetching directory stats: {str(e)}", 500
+        return jsonify({
+            "google_apps_script_status": apps_status,
+            "status": "error",
+            "message": f"Error listing files: {str(e)}"
+        })
 
-    # --- שלב 2: הורדת הקובץ ---
-    download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{audio_path}"
-    temp_audio_path = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
+    # --- הורדת הקובץ האחרון ---
     try:
-        audio_resp = requests.get(download_url)
-        audio_resp.raise_for_status()
-        with open(temp_audio_path, "wb") as f:
-            f.write(audio_resp.content)
+        download_resp = requests.get(CALL2ALL_DOWNLOAD_URL, params={"token": token, "path": f"ivr2:{path_param}/{max_file}"})
+        download_resp.raise_for_status()
+        temp_audio = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
+        with open(temp_audio, "wb") as f:
+            f.write(download_resp.content)
     except Exception as e:
-        return f"Error downloading audio: {str(e)}", 500
+        return jsonify({
+            "google_apps_script_status": apps_status,
+            "status": "error",
+            "message": f"Error downloading file: {str(e)}"
+        })
 
-    # --- שלב 3: תמלול הקובץ ---
-    text = recognize_speech(temp_audio_path)
-    if os.path.exists(temp_audio_path):
-        os.remove(temp_audio_path)
-
+    # --- תמלול הקובץ ---
+    text = recognize_speech(temp_audio)
+    if os.path.exists(temp_audio):
+        os.remove(temp_audio)
     if "ERROR_SR" in text:
-        return "Error in transcription", 500
+        return jsonify({
+            "google_apps_script_status": apps_status,
+            "status": "error",
+            "message": "Error in transcription"
+        })
 
-    # --- שלב 4: שליחת הטקסט ל-Google Chat ---
-    chat_url = f"https://chat.googleapis.com/v1/spaces/AAQAWjjfDoU/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token={token_g}"
+    # --- שליחת ההודעה ל-Google Chat ---
+    chat_status = None
     try:
-        chat_resp = requests.post(chat_url, json={"text": text})
+        chat_resp = requests.post(
+            f"{GOOGLE_CHAT_WEBHOOK}&token={token_g}",
+            json={"text": text}
+        )
+        chat_status = chat_resp.status_code
     except Exception as e:
-        chat_resp = None
+        chat_status = f"error: {str(e)}"
 
-    # --- שלב 5: שליחת GET ל-URL חיצוני עם כל הפרמטרים שקיבלנו מלבד token/token_g/URL ---
-    params_to_send = {k: v for k, v in request.args.items() if k not in ["token", "token_g", "URL"]}
-    params_to_send["transcribed_text"] = text
-    try:
-        ext_resp = requests.get(url_external, params=params_to_send)
-    except Exception as e:
-        ext_resp = None
-
-    # --- שלב 6: החזרת סטטוס ---
     return jsonify({
-        "google_chat_status": chat_resp.status_code if chat_resp else "error",
-        "external_url_status": ext_resp.status_code if ext_resp else "error",
+        "google_apps_script_status": apps_status,
+        "google_chat_status": chat_status,
         "status": "ok",
         "transcribed_text": text
     })
