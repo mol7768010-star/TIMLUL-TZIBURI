@@ -1,83 +1,46 @@
-from flask import Flask, request
 import os
 import requests
+import speech_recognition as sr
 
-app = Flask(__name__)  # 🔥 חייב להיות לפני כל route
-@app.route("/transcribe", methods=["GET"])
-def transcribe():
-    token = request.args.get('token', '')
-    folder_path = request.args.get('path', '')  # במקום K
-    api_id = request.args.get('ApiCallId', '')
-    forward_url = request.args.get('URL', '')
-    token_g = request.args.get('token_g', '')
+TEMP_DIR = "/tmp/"
 
-    if not api_id:
-        return "Missing ApiCallId", 400
+def recognize_speech(file_path):
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(file_path) as source:
+        audio = recognizer.record(source)
+    return recognizer.recognize_google(audio, language="he-IL")
 
-    # --- שלב 1: קבלת הקובץ האחרון ---
-    list_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{folder_path}"
+def process_call(token, token_g, path, google_url):
+    # 1️⃣ קבלת רשימת הקבצים
+    stats_url = f"https://www.call2all.co.il/ym/api/GetIVR2DirStats?token={token}&path=ivr2:{path}"
+    r = requests.get(stats_url)
+    data = r.json()
+    if data["responseStatus"] != "OK" or "maxFile" not in data:
+        return f"Error listing files: {r.text}"
 
+    max_file_path = data["maxFile"]["path"]
+    
+    # 2️⃣ הורדת הקובץ האחרון
+    download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{max_file_path}"
+    audio_response = requests.get(download_url)
+    if audio_response.status_code != 200:
+        return f"Error downloading file: {audio_response.status_code}"
+
+    temp_audio_path = os.path.join(TEMP_DIR, max_file_path.split('/')[-1])
+    with open(temp_audio_path, "wb") as f:
+        f.write(audio_response.content)
+
+    # 3️⃣ תמלול
     try:
-        resp = requests.get(list_url)
-        data = resp.json()
-
-        if data.get("responseStatus") != "OK":
-            return "id_list_message=f-List_Error."
-
-        max_file = data.get("maxFile", {})
-        file_path = max_file.get("path")
-
-        if not file_path:
-            return "id_list_message=f-No_File."
-
+        text = recognize_speech(temp_audio_path)
     except Exception as e:
-        return f"Error listing files: {str(e)}"
+        return f"Error in transcription: {e}"
+    finally:
+        os.remove(temp_audio_path)
 
-    # --- שלב 2: הורדת הקובץ ---
-    download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{file_path}"
-
-    try:
-        audio_response = requests.get(download_url)
-
-        if audio_response.status_code != 200:
-            return "id_list_message=f-Download_Failed."
-
-        temp_audio = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
-
-        with open(temp_audio, "wb") as f:
-            f.write(audio_response.content)
-
-    except Exception as e:
-        return f"Download error: {str(e)}"
-
-    # --- שלב 3: תמלול ---
-    text = recognize_speech(temp_audio)
-
-    if os.path.exists(temp_audio):
-        os.remove(temp_audio)
-
-    if "ERROR_SR" in text:
-        return "id_list_message=f-Error_Transcription."
-
-    # --- שלב 4: שליחה ל-Google Chat ---
-    chat_url = f"https://chat.googleapis.com/v1/spaces/AAQAWjjfDoU/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token={token_g}"
-
-    try:
-        requests.post(chat_url, json={"text": text})
-    except Exception as e:
-        return f"Chat error: {str(e)}"
-
-    # --- שלב 5: שליחת פרמטרים לא מנוצלים ---
-    if forward_url:
-        unused_params = request.args.to_dict()
-
-        # אפשר להסיר מה שכבר השתמשנו
-        for used in ["path", "token_g"]:
-            unused_params.pop(used, None)
-
-        try:
-            requests.get(forward_url, params=unused_params)
-        except Exception as e:
-            return f"Forward error: {str(e)}"
-
-    return "id_list_message=m-1452."
+    # 4️⃣ שליחת הטקסט ל־Google Chat
+    chat_payload = {
+        "text": text
+    }
+    chat_response = requests.post(google_url, json=chat_payload, params={"token": token_g})
+    return f"Sent to Google Chat, status: {chat_response.status_code}"
