@@ -1,3 +1,8 @@
+from flask import Flask, request
+import os
+import requests
+
+app = Flask(__name__)  # 🔥 חייב להיות לפני כל route
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
     token = request.args.get('token', '')
