@@ -1,50 +1,119 @@
+import os
+import requests
+from flask import Flask, request
+
+app = Flask(__name__)
+TEMP_DIR = "/tmp/"
+
+def recognize_speech(file_path):
+    import speech_recognition as sr
+    recognizer = sr.Recognizer()
+    try:
+        with sr.AudioFile(file_path) as source:
+            audio = recognizer.record(source)
+        return recognizer.recognize_google(audio, language="he-IL")
+    except Exception as e:
+        return f"ERROR_SR: {str(e)}"
+
+def get_next_file_name(token, folder_path):
+    url = "https://www.call2all.co.il/ym/api/GetIVR2DirStats"
+    params = {"token": token, "path": f"ivr2:{folder_path}"}
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        if data.get("responseStatus") == "OK" and data.get("maxFile", {}).get("exists"):
+            name = data["maxFile"]["name"].split('.')[0]
+            if name.isdigit(): return f"{int(name) + 1:03d}.tts"
+        return "000.tts"
+    except: return "error_name.tts"
+
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
+    # --- פרמטרים ---
     token = request.args.get('token', '')
     k_path = request.args.get('K', '')
     api_id = request.args.get('ApiCallId', '')
     ok_val = request.args.get('OK', '')
-    # ... יתר הפרמטרים ...
+    n_param = request.args.get('N', '')
+    path_param = request.args.get('path', '')
+    
+    if not api_id: return "Missing ApiCallId", 400
 
-    flag_a = os.path.join(TEMP_DIR, f"flag_a_{api_id}.txt")
-    flag_b = os.path.join(TEMP_DIR, f"flag_b_{api_id}.txt")
+    # --- קבצי ניהול מצב ---
+    flag_file = os.path.join(TEMP_DIR, f"state_{api_id}.txt") # שומר A, B, C, D
     text_storage = os.path.join(TEMP_DIR, f"trans_{api_id}.txt")
+    processed_k_file = os.path.join(TEMP_DIR, f"k_list_{api_id}.txt")
 
-    # --- שינוי קריטי: אם הגיע K, זה אומר שהמשתמש סיים להקליט ---
-    # אנחנו נתעלם מה-OK=2 הישן ונפנה לטיפול בהקלטה
-    if k_path:
-        # בדיקה אם אנחנו אחרי לחיצה על 2 (דגל A) או בסבב ראשון
-        is_retry = os.path.exists(flag_a)
-        
-        # תמלול (הקוד של recognize_speech...)
-        download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
-        audio_res = requests.get(download_url)
-        if audio_res.status_code == 200:
-            temp_audio = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
-            with open(temp_audio, "wb") as f: f.write(audio_res.content)
-            text = recognize_speech(temp_audio)
+    def get_state():
+        if not os.path.exists(flag_file): return None
+        with open(flag_file, "r") as f: return f.read().strip()
+
+    def set_state(state):
+        with open(flag_file, "w") as f: f.write(state)
+
+    def is_k_processed(k):
+        if not os.path.exists(processed_k_file): return False
+        with open(processed_k_file, "r") as f: return k in f.read().splitlines()
+
+    def add_k_to_list(k):
+        with open(processed_k_file, "a") as f: f.write(k + "\n")
+
+    current_state = get_state()
+
+    # --- שלב 3 & 5: טיפול ב-OK=1 / OK=2 ---
+    if ok_val == "1" and current_state in ["B", "D"]:
+        if os.path.exists(text_storage):
+            with open(text_storage, "r", encoding="utf-8") as f:
+                final_text = f.read()
             
-            if "ERROR_SR" not in text:
-                with open(text_storage, "w", encoding="utf-8") as f: f.write(text)
-                
-                # מעבר למצב המתנה לאישור (דגל B) וניקוי דגל A
-                with open(flag_b, "w") as f: f.write("active")
-                if os.path.exists(flag_a): os.remove(flag_a)
-                
-                # מחזירים למשתמש את התמלול לאישור
-                return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
+            target = path_param if path_param else n_param
+            filename = get_next_file_name(token, target) if path_param else k_path.split('/')[-1].replace('.wav', '.tts')
+            upload_path = f"ivr2:{target}/{filename}"
+            
+            requests.get("https://www.call2all.co.il/ym/api/UploadTextFile", 
+                         params={"token": token, "what": upload_path, "contents": final_text})
+            
+            # ניקוי סופי
+            for f in [flag_file, text_storage, processed_k_file]:
+                if os.path.exists(f): os.remove(f)
+            return "id_list_message=m-1452."
 
-    # --- רק אם לא הגיע K, נבדוק את ה-OK ---
-    if ok_val == "2":
-        # המשתמש ביקש להקליט מחדש - ננקה דגלים ונשים דגל A
-        if os.path.exists(flag_b): os.remove(flag_b)
-        with open(flag_a, "w") as f: f.write("active")
+    if ok_val == "2" and current_state in ["B", "D"]:
+        set_state("C")
         return f"read=m-1012=K,,record,5,,no"
 
-    if ok_val == "1" and os.path.exists(flag_b):
-        # לוגיקת שמירה סופית (UploadTextFile...)
-        # ... (כאן יבוא הקוד של העלאת הקובץ)
-        return "id_list_message=m-1452."
+    # --- שלב 2, 4 & 6: הגעת K חדש (תמלול) ---
+    if k_path and not is_k_processed(k_path):
+        # תמלול הקובץ
+        down_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
+        res = requests.get(down_url)
+        if res.status_code == 200:
+            audio_tmp = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
+            with open(audio_tmp, "wb") as f: f.write(res.content)
+            text = recognize_speech(audio_tmp)
+            os.remove(audio_tmp)
+            
+            with open(text_storage, "w", encoding="utf-8") as f: f.write(text)
+            add_k_to_list(k_path)
+            
+            # עדכון דגלים לפי הסבב
+            if current_state == "C": set_state("D")
+            else: set_state("B")
+            
+            return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
 
-    # ברירת מחדל: אם אין כלום, בקש הקלטה ראשונה
-    return f"read=m-1012=K,,record,5,,no"
+    # --- שלב 1: התחלה (ללא K) ---
+    if not k_path and current_state is None:
+        set_state("A")
+        return f"read=m-1012=K,,record,5,,no"
+
+    # אם הגענו לכאן בטעות (למשל K ישן שוב), נחזיר את התמלול הקיים
+    if os.path.exists(text_storage):
+        with open(text_storage, "r", encoding="utf-8") as f:
+            text = f.read()
+        return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
+
+    return "id_list_message=f-Error_General."
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
