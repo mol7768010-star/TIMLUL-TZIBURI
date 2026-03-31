@@ -80,7 +80,7 @@ def transcribe():
 
     if ok_val == "2" and current_state in ["B", "D"]:
         set_state("C")
-        return f"read=m-1012=K,,record,5,,no"
+        return f"read=m-1012=K,,record,{m_param},,no"
 
     # --- שלב 2, 4 & 6: הגעת K חדש (תמלול) ---
     if k_path and not is_k_processed(k_path):
