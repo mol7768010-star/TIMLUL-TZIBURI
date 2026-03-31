@@ -1,5 +1,6 @@
 import os
 import requests
+import time
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -11,104 +12,106 @@ def recognize_speech(file_path):
     try:
         with sr.AudioFile(file_path) as source:
             audio = recognizer.record(source)
+        # תמלול באמצעות גוגל בשפה העברית
         return recognizer.recognize_google(audio, language="he-IL")
     except Exception as e:
         return f"ERROR_SR: {str(e)}"
 
 def get_next_file_name(token, folder_path):
-    """
-    פונקציה שבודקת מהו הקובץ הכי גבוה בשלוחה ומחזירה את המספר הבא בתור עם סיומת .tts
-    """
+    """בדיקת הקובץ האחרון בשלוחה והחזרת המספר הבא בתור"""
     url = "https://www.call2all.co.il/ym/api/GetIVR2DirStats"
     params = {"token": token, "path": f"ivr2:{folder_path}"}
     try:
         response = requests.get(url, params=params)
         data = response.json()
         if data.get("responseStatus") == "OK" and data.get("maxFile", {}).get("exists"):
-            max_name = data["maxFile"]["name"]  # למשל "386.wav"
+            max_name = data["maxFile"]["name"]
             name_without_ext = max_name.split('.')[0]
             if name_without_ext.isdigit():
                 next_number = int(name_without_ext) + 1
-                return f"{next_number:03d}.tts" # שומר על פורמט 3 ספרות אם תרצה, או פשוט str
-        return "000.tts" # ברירת מחדל אם השלוחה ריקה
+                return f"{next_number:03d}.tts"
+        return "000.tts"
     except Exception:
         return "error_name.tts"
 
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
-    # שליפת פרמטרים
+    # --- שליפת פרמטרים ---
     token = request.args.get('token', '')
     k_path = request.args.get('K', '')
     m_param = request.args.get('M', '5')
     n_param = request.args.get('N', '')
-    path_param = request.args.get('path', '') # הפרמטר החדש
+    path_param = request.args.get('path', '')
     api_id = request.args.get('ApiCallId', '')
     ok_val = request.args.get('OK', '')
     log_enabled = request.args.get('LOG') == "1"
 
-    logs = []
-    
     if not api_id:
         return "Missing ApiCallId", 400
 
+    # הגדרת נתיבים לקבצי ניהול מצב
     text_storage = os.path.join(TEMP_DIR, f"trans_{api_id}.txt")
+    last_k_file = os.path.join(TEMP_DIR, f"last_k_{api_id}.txt")
     ignore_flag = os.path.join(TEMP_DIR, f"ignore_{api_id}.txt")
 
+    # --- טיפול ב-OK=2 (הקלטה מחדש) ---
+    if ok_val == "2":
+        if os.path.exists(text_storage): os.remove(text_storage)
+        if os.path.exists(last_k_file): os.remove(last_k_file)
+        with open(ignore_flag, "w") as f: f.write("1")
+        return f"read=m-1012=K,,record,{m_param},,no"
+
+    # בדיקה אם אנחנו במצב "התעלמות" אחרי הקלטה מחדש
     if os.path.exists(ignore_flag):
         os.remove(ignore_flag)
         ok_val = None
 
-    # --- שלב 2: אישור המשתמש ושמירה סופית (OK=1) ---
+    # --- שלב האישור הסופי (OK=1) ---
     if ok_val == "1":
         if os.path.exists(text_storage):
             with open(text_storage, "r", encoding="utf-8") as f:
                 final_text = f.read()
             
-            # קביעת יעד השמירה
+            # קביעת יעד השמירה (לפי path או לפי N)
             if path_param:
-                # אם נשלח path, מחפשים את המספר הבא בשלוחה
-                target_folder = path_param
-                filename = get_next_file_name(token, target_folder)
-                upload_path = f"ivr2:{target_folder}/{filename}"
+                filename = get_next_file_name(token, path_param)
+                upload_path = f"ivr2:{path_param}/{filename}"
             else:
-                # אם נשלח N (או כברירת מחדל), עובדים לפי הלוגיקה הישנה
                 orig_filename = k_path.split('/')[-1] if k_path else "file.wav"
                 upload_path = f"ivr2:{n_param}/{orig_filename.replace('.wav', '.tts')}"
             
             upload_url = "https://www.call2all.co.il/ym/api/UploadTextFile"
-            params = {
-                "token": token,
-                "what": upload_path,
-                "contents": final_text
-            }
-            
-            if log_enabled: logs.append(f"Target path: {upload_path}")
+            params = {"token": token, "what": upload_path, "contents": final_text}
             
             try:
                 response = requests.get(upload_url, params=params)
                 if response.status_code == 200:
-                    os.remove(text_storage)
-                    res = "id_list_message=m-1452." # הודעת סיום מוצלחת
-                else:
-                    res = f"id_list_message=f-Server_Error_{response.status_code}."
-            except Exception as e:
-                res = "id_list_message=f-Connection_Error."
-        else:
-            res = "id_list_message=f-No_Stored_Text."
+                    # ניקוי קבצים לאחר סיום מוצלח
+                    for f in [text_storage, last_k_file]:
+                        if os.path.exists(f): os.remove(f)
+                    return "id_list_message=m-1452."
+                return f"id_list_message=f-Server_Error_{response.status_code}."
+            except:
+                return "id_list_message=f-Connection_Error."
+        return "id_list_message=f-No_Stored_Text."
 
-        return "<br>".join(logs) if log_enabled else res
-
-    # --- טיפול ב-OK=2 (הקלטה מחדש) ---
-    elif ok_val == "2":
-        with open(ignore_flag, "w") as f: f.write("1")
-        return f"read=m-1012=K,,record,{m_param},,no"
-
-    # --- שלב 1: הקלטה או תמלול ---
+    # --- שלב התמלול (או בקשת הקלטה) ---
     if not k_path:
         return f"read=m-1012=K,,record,{m_param},,no"
 
+    # בדיקה: האם הקובץ הזה כבר תומלל בבקשה קודמת?
+    current_last_k = ""
+    if os.path.exists(last_k_file):
+        with open(last_k_file, "r") as f:
+            current_last_k = f.read().strip()
+
+    if k_path == current_last_k and os.path.exists(text_storage):
+        with open(text_storage, "r", encoding="utf-8") as f:
+            text = f.read()
+        return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
+
+    # הורדה ותמלול של קובץ חדש
     download_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
-    
     try:
         audio_response = requests.get(download_url)
         if audio_response.status_code == 200:
@@ -122,13 +125,14 @@ def transcribe():
             if "ERROR_SR" in text:
                 return "id_list_message=f-Error_Transcription."
             
+            # שמירת התוצאה וה-K הנוכחי
             with open(text_storage, "w", encoding="utf-8") as f:
                 f.write(text)
+            with open(last_k_file, "w") as f:
+                f.write(k_path)
             
-            # החזרת הפלט למשתמש לאישור (OK=1 לאישור, OK=2 להקלטה מחדש)
             return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
-        else:
-            return "id_list_message=f-Download_Failed."
+        return "id_list_message=f-Download_Failed."
     except Exception as e:
         return f"Error: {str(e)}"
 
