@@ -106,7 +106,7 @@ def transcribe():
     # --- שלב 1: התחלה (ללא K) ---
     if not k_path and current_state is None:
         set_state("A")
-        return f"read=m-1012=K,,record,5,,no"
+        return f"read=m-1012=K,,record,{m_param},,no"
 
     # אם הגענו לכאן בטעות (למשל K ישן שוב), נחזיר את התמלול הקיים
     if os.path.exists(text_storage):
