@@ -29,21 +29,19 @@ def get_next_file_name(token, folder_path):
 
 @app.route("/transcribe", methods=["GET"])
 def transcribe():
-    # --- פרמטרים ---
     token = request.args.get('token', '')
-    k_path = request.args.get('K', '')
     api_id = request.args.get('ApiCallId', '')
     ok_val = request.args.get('OK', '')
-    n_param = request.args.get('N', '')
     path_param = request.args.get('path', '')
+    n_param = request.args.get('N', '')
     m_param = request.args.get('M', '')
     
     if not api_id: return "Missing ApiCallId", 400
 
-    # --- קבצי ניהול מצב ---
-    flag_file = os.path.join(TEMP_DIR, f"state_{api_id}.txt") # שומר A, B, C, D
+    # קבצי ניהול מצב
+    flag_file = os.path.join(TEMP_DIR, f"state_{api_id}.txt")
     text_storage = os.path.join(TEMP_DIR, f"trans_{api_id}.txt")
-    processed_k_file = os.path.join(TEMP_DIR, f"k_list_{api_id}.txt")
+    k_counter_file = os.path.join(TEMP_DIR, f"k_count_{api_id}.txt")
 
     def get_state():
         if not os.path.exists(flag_file): return None
@@ -52,67 +50,68 @@ def transcribe():
     def set_state(state):
         with open(flag_file, "w") as f: f.write(state)
 
-    def is_k_processed(k):
-        if not os.path.exists(processed_k_file): return False
-        with open(processed_k_file, "r") as f: return k in f.read().splitlines()
+    def get_k_count():
+        if not os.path.exists(k_counter_file): return 0
+        with open(k_counter_file, "r") as f: return int(f.read().strip())
 
-    def add_k_to_list(k):
-        with open(processed_k_file, "a") as f: f.write(k + "\n")
+    def inc_k_count():
+        count = get_k_count() + 1
+        with open(k_counter_file, "w") as f: f.write(str(count))
+        return count
 
     current_state = get_state()
+    current_k_num = get_k_count()
+    
+    # חיפוש האם התקבל K כלשהו (K1, K2, K3...)
+    received_k_path = None
+    if current_k_num > 0:
+        received_k_path = request.args.get(f'K{current_k_num}')
 
-    # --- שלב 3 & 5: טיפול ב-OK=1 / OK=2 ---
-    if ok_val == "1" and current_state in ["B", "D"]:
+    # --- שלב סיום: OK=1 ---
+    if ok_val == "1":
         if os.path.exists(text_storage):
             with open(text_storage, "r", encoding="utf-8") as f:
                 final_text = f.read()
             
             target = path_param if path_param else n_param
-            filename = get_next_file_name(token, target) if path_param else k_path.split('/')[-1].replace('.wav', '.tts')
+            # שם הקובץ לשמירה
+            filename = get_next_file_name(token, target) if path_param else f"transcription_{api_id}.tts"
             upload_path = f"ivr2:{target}/{filename}"
             
             requests.get("https://www.call2all.co.il/ym/api/UploadTextFile", 
                          params={"token": token, "what": upload_path, "contents": final_text})
             
-            # ניקוי סופי
-            for f in [flag_file, text_storage, processed_k_file]:
+            # ניקוי קבצים
+            for f in [flag_file, text_storage, k_counter_file]:
                 if os.path.exists(f): os.remove(f)
             return "id_list_message=m-1452."
 
-    if ok_val == "2" and current_state in ["B", "D"]:
-        set_state("C")
-        return f"read=m-1012=K,,record,{m_param},,no"
+    # --- שלב תיקון: OK=2 ---
+    if ok_val == "2":
+        next_k = inc_k_count()
+        set_state("RETRY")
+        return f"read=m-1012=K{next_k},,record,{m_param},,no"
 
-    # --- שלב 2, 4 & 6: הגעת K חדש (תמלול) ---
-    if k_path and not is_k_processed(k_path):
-        # תמלול הקובץ
-        down_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{k_path}"
+    # --- שלב עיבוד הקלטה (K) ---
+    if received_k_path:
+        down_url = f"https://www.call2all.co.il/ym/api/DownloadFile?token={token}&path=ivr2:{received_k_path}"
         res = requests.get(down_url)
         if res.status_code == 200:
             audio_tmp = os.path.join(TEMP_DIR, f"audio_{api_id}.wav")
             with open(audio_tmp, "wb") as f: f.write(res.content)
             text = recognize_speech(audio_tmp)
-            os.remove(audio_tmp)
+            if os.path.exists(audio_tmp): os.remove(audio_tmp)
             
             with open(text_storage, "w", encoding="utf-8") as f: f.write(text)
-            add_k_to_list(k_path)
-            
-            # עדכון דגלים לפי הסבב
-            if current_state == "C": set_state("D")
-            else: set_state("B")
+            set_state("WAITING_FOR_OK")
             
             return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
 
-    # --- שלב 1: התחלה (ללא K) ---
-    if not k_path and current_state is None:
-        set_state("A")
-        return f"read=m-1012=K,,record,{m_param},,no"
-
-    # אם הגענו לכאן בטעות (למשל K ישן שוב), נחזיר את התמלול הקיים
-    if os.path.exists(text_storage):
-        with open(text_storage, "r", encoding="utf-8") as f:
-            text = f.read()
-        return f"read=t-{text}.m-1078=OK,,1,1,,NO,,,,12,,,,,no"
+    # --- שלב התחלה ראשוני ---
+    if current_state is None:
+        next_k = inc_k_count()
+        set_state("START")
+        return f"read=m-1012=K{next_k},,record,{m_param},,no"
 
     return "id_list_message=f-Error_General."
 
